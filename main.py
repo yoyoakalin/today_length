@@ -1,130 +1,97 @@
-import random
-import json
 import asyncio
+import random
+import aiosqlite
+import os
 from datetime import datetime
-from pathlib import Path
-
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register, StarTools
-import astrbot.api.message_components as Comp
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star, register
 
-@register("today_length", "GeMio", "全功能名片版：今日长度", "1.6.0")
-class TodayLengthPlugin(Star):
+@register("daily_length_db", "GeMio", "SQL版异步长度插件", "1.2.0")
+class DailyLengthPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.data_dir = StarTools.get_data_dir("today_length")
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.storage_path = self.data_dir / "records.json"
-        self.lock = asyncio.Lock()
-        self.storage = self._load_data()
+        self.db_path = os.path.join(os.path.dirname(__file__), "data.db")
+        self.lock = asyncio.Lock() # 用于内存级操作保护
 
-    def _load_data(self) -> dict:
-        default_data = {"date": "", "records": {}} # records 格式: {uid: {"len": 12, "name": "昵称"}}
-        if not self.storage_path.exists():
-            return default_data
-        try:
-            content = self.storage_path.read_text(encoding="utf-8")
-            data = json.loads(content)
-            if "records" in data:
-                data["records"] = {str(k): v for k, v in data["records"].items()}
-            return data
-        except Exception as e:
-            logger.error(f"[TodayLength] 加载失败: {e}")
-            return default_data
+    async def _init_db(self):
+        """初始化数据库表"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS records (
+                    user_id TEXT PRIMARY KEY,
+                    nickname TEXT,
+                    length INTEGER,
+                    record_date TEXT
+                )
+            ''')
+            await db.commit()
 
-    async def _save_data(self):
-        try:
-            content = json.dumps(self.storage, ensure_ascii=False, indent=4)
-            self.storage_path.write_text(content, encoding="utf-8")
-        except Exception as e:
-            logger.error(f"[TodayLength] 存储失败: {e}")
-
-    async def _get_today_data(self) -> dict:
-        async with self.lock:
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            if self.storage.get("date") != today_str:
-                self.storage = {"date": today_str, "records": {}}
-                await self._save_data()
-            return self.storage
-
-    async def _get_user_nickname(self, event: AstrMessageEvent, user_id: int) -> str:
-        """获取用户昵称/群名片的核心逻辑"""
-        try:
-            group_id = event.get_group_id()
-            if group_id:
-                # 调用底层 OneBot API 获取群成员信息
-                payload = {"group_id": int(group_id), "user_id": int(user_id)}
-                # 兼容不同版本的接口调用方式
-                resp = await event.bot.get_group_member_info(**payload)
-                if resp:
-                    # 优先获取群名片，其次是昵称
-                    return resp.get("card") or resp.get("nickname") or str(user_id)
-            
-            # 如果不是群聊或获取失败，尝试获取陌生人信息
-            resp = await event.bot.get_stranger_info(user_id=int(user_id))
-            return resp.get("nickname") or str(user_id)
-        except Exception as e:
-            logger.debug(f"[TodayLength] 获取昵称失败 {user_id}: {e}")
-            return str(user_id)
+    async def _get_user_nickname(self, event: AstrMessageEvent, user_id: str) -> str:
+        name = event.get_sender_name()
+        return name if name else f"用户_{user_id[-4:]}"
 
     @filter.command("今日长度")
     async def handle_length(self, event: AstrMessageEvent):
-        await self._get_today_data()
+        await self._init_db() # 确保表已创建
         user_id = str(event.get_sender_id())
-        
-        async with self.lock:
-            user_records = self.storage["records"]
-            if user_id in user_records:
-                data = user_records[user_id]
-                length = data["len"]
-                nickname = data.get("name", user_id)
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        async with aiosqlite.connect(self.db_path) as db:
+            # 1. 检查今日是否已有记录
+            async with db.execute(
+                "SELECT length, nickname FROM records WHERE user_id = ? AND record_date = ?", 
+                (user_id, today)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row:
+                length, nickname = row
                 is_new = False
             else:
-                length = round(random.uniform(1, 20), 2)
-                # 获取当前最新的昵称并存入缓存
-                nickname = await self._get_user_nickname(event, int(user_id))
-                user_records[user_id] = {"len": length, "name": nickname}
-                await self._save_data()
+                # 2. 准备新数据（锁外获取昵称，提升并发）
+                length = random.randint(1, 30)
+                nickname = await self._get_user_nickname(event, user_id)
                 is_new = True
 
-        msg = f"{nickname}，你的今日长度为：{length} cm"
-        if not is_new: msg = "（今日已锁定）" + msg
-        
-        yield event.chain_result([Comp.At(qq=user_id), Comp.Plain(f" {msg}")])
+                # 3. 写入/更新数据
+                # 注意：这里使用 REPLACE 或先删除旧日期数据，保证一人一天一行
+                await db.execute(
+                    "REPLACE INTO records (user_id, nickname, length, record_date) VALUES (?, ?, ?, ?)",
+                    (user_id, nickname, length, today)
+                )
+                await db.commit()
+
+        msg = f"{nickname} 今天的长度是 {length}cm！"
+        if not is_new:
+            msg = "（今日已锁定）" + msg
+            
+        yield event.plain_result(msg)
 
     @filter.command("长度排行")
     async def handle_rank(self, event: AstrMessageEvent):
-        await self._get_today_data()
-        
-        async with self.lock:
-            user_records = self.storage.get("records", {})
+        await self._init_db()
+        today = datetime.now().strftime("%Y-%m-%d")
 
-        if not user_records:
-            yield event.plain_result("今日榜单空空如也。")
+        async with aiosqlite.connect(self.db_path) as db:
+            # 利用 SQL 引擎进行排序，比 Python 排序效率更高
+            async with db.execute(
+                "SELECT nickname, length FROM records WHERE record_date = ? ORDER BY length DESC", 
+                (today,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        if not rows:
+            yield event.plain_result("今天还没有人参与测试哦~")
             return
 
-        # 排序：根据记录中的 'len' 字段排序
-        sorted_ranks = sorted(
-            user_records.items(), 
-            key=lambda x: x[1]['len'], 
-            reverse=True
-        )
+        chunk_size = 15
+        header = "🏆 今日长度排行榜 (SQL) 🏆\n" + "—" * 20 + "\n"
         
-        header = f"📊 今日全员榜 ({self.storage['date']})\n━━━━━━━━━━━━━━\n"
-        lines = []
-        for i, (uid, data) in enumerate(sorted_ranks, 1):
-            medal = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"[{i}] "
-            name = data.get("name", uid)
-            length = data.get("len", 0)
-            lines.append(f"{medal}{name}：{length} cm")
-
-        # 分片发送，每 50 人一组
-        chunk_size = 50 
-        for i in range(0, len(lines), chunk_size):
-            chunk = lines[i:i + chunk_size]
-            output = header + "\n".join(chunk) if i == 0 else "\n".join(chunk)
-            yield event.plain_result(output)
-
-    def terminate(self):
-        logger.info("[TodayLength] 插件安全卸载")
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i : i + chunk_size]
+            rank_text = header if i == 0 else ""
+            for index, (nick, l_val) in enumerate(chunk, start=i + 1):
+                rank_text += f"{index}. {nick}: {l_val}cm\n"
+            
+            yield event.plain_result(rank_text.strip())
