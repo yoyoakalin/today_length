@@ -1,4 +1,5 @@
-name: today_length
+name: astrbot_plugin_today_length
 description: 每日长度趣味插件
 version: 1.0.0
-author: GeMio
+author: YOYO
+repo: https://github.com/yoyoakalin/today_length/tree/main
